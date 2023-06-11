@@ -1,34 +1,120 @@
--- proto/fields
+-- Wireshark dissector for PangYa
+-- Hacked together by John Chadwick.
 
-pangya_protocol = Proto("PangYa",  "PangYa Protocol")
-key_field = ProtoField.uint8("pangya.key", "key", base.DEC)
-type_field = ProtoField.string("pangya.type", "type", base.ASCII, "type of server, e.g. 'game'")
-server_field = ProtoField.bool("pangya.server", "server", base.NONE)
-client_field = ProtoField.bool("pangya.client", "client", base.NONE)
-salt_field = ProtoField.uint8("pangya.salt", "salt", base.DEC)
-length_field = ProtoField.uint16("pangya.length", "length", base.DEC)
+local debug_level = {
+  DISABLED = 0,
+  VERBOSE  = 1,
+}
+
+local default_settings = {
+  debug_level         = debug_level.DISABLED,
+  enabled             = true,
+
+  -- Specifies additional ports (alongside the defaults) for the various
+  -- kinds of PangYa servers.
+  login_server_port   = 10103, -- additional login server port
+  game_server_port    = 20201, -- additional game server port
+  message_server_port = 30303, -- additional message server port
+}
+
+-- region Debug helpers
+
+local dprint = function(...) end
+
+local function setupDebugPrint()
+  if default_settings.debug_level == debug_level.DISABLED then
+    dprint = function() end
+  else
+    dprint = function(...)
+      print(table.concat({"pangya:", ...}, " "))
+    end
+  end
+end
+
+-- endregion
+
+-- region Plugin info/settings
+
+set_plugin_info({
+  version = "1.0.0",
+  author = "John Chadwick",
+  repository = "https://github.com/pangbox/pangya-wireshark-dissector"
+})
+
+local server_type = {
+  LOGIN_SERVER = 0,
+  GAME_SERVER = 1,
+  MESSAGE_SERVER = 2,
+}
+
+-- Constructs a map of ports to server types.
+local portMapping
+local function setupPortMap()
+  -- Known port mappings (should be synced with pantrant)
+  portMapping = {
+    [10101] = server_type.LOGIN_SERVER,
+    [10201] = server_type.LOGIN_SERVER,
+    [10103] = server_type.LOGIN_SERVER,
+    [20201] = server_type.GAME_SERVER,
+    [20202] = server_type.GAME_SERVER,
+    [20203] = server_type.GAME_SERVER,
+    [10102] = server_type.MESSAGE_SERVER,
+    [30303] = server_type.MESSAGE_SERVER,
+  }
+  portMapping[default_settings.login_server_port] = server_type.LOGIN_SERVER
+  portMapping[default_settings.game_server_port] = server_type.GAME_SERVER
+  portMapping[default_settings.message_server_port] = server_type.MESSAGE_SERVER
+  return portMapping
+end
+setupPortMap()
+
+local function getServerType(port)
+  local type = portMapping[port]
+  if type == server_type.LOGIN_SERVER then return "login"
+  elseif type == server_type.GAME_SERVER then return "game"
+  elseif type == server_type.MESSAGE_SERVER then return "message"
+  end
+  return "(unknown)"
+end
+
+-- endregion
+
+-- region Protocol definition
+
+local pangya_protocol = Proto("PangYa",  "PangYa Protocol")
+local key_field = ProtoField.uint8("pangya.key", "Key", base.DEC)
+local type_field = ProtoField.string("pangya.type", "Type", base.ASCII, "type of server, e.g. 'game'")
+local length_field = ProtoField.uint16("pangya.length", "Packet Length", base.DEC)
+local server_field = ProtoField.bool("pangya.server", "Server Packet", base.NONE)
+local client_field = ProtoField.bool("pangya.client", "Client Packet", base.NONE)
+local salt_field = ProtoField.uint8("pangya.salt", "Salt", base.DEC)
+local encrypted_field = ProtoField.bytes("pangya.encrypted", "Encrypted data", base.NONE)
 
 pangya_protocol.fields = {
   key_field,
   type_field,
   length_field,
   server_field,
+  client_field,
   salt_field,
-  client_field
+  encrypted_field
 }
-
--- dissecting fields
 
 local stream_index = Field.new("tcp.stream")
 
--- WTF? A pure lua5.1 bitwise ops implementation.
--- I have no idea how this works.
--- https://stackoverflow.com/a/32389020
+-- endregion
+
+-- region Bitops
+-- (Very clever) pure Lua 5.1 bitop implementation.
+-- From https://stackoverflow.com/a/32389020
+-- We use this instead of the included bitop module as it may be removed in the
+-- future.
+-- See: https://www.wireshark.org/lists/wireshark-dev/201807/msg00046.html
 
 OR, XOR, AND = 1, 3, 4
 
-function bitoper(a, b, oper)
-   local r, m, s = 0, 2^31
+local function bitoper(a, b, oper)
+   local r, m, s = 0, 2^31, nil
    repeat
       s,a,b = a+b+m, a%m, b%m
       r,m = r + m*oper%(s-a-b), m/2
@@ -36,7 +122,220 @@ function bitoper(a, b, oper)
    return r
 end
 
--- pangya crypt tables
+-- endregion
+
+-- region Lzo1x
+
+local LzoReader = {}
+
+function LzoReader:new(bytes)
+  local reader = { b = bytes, idx = 0 }
+  setmetatable(reader, self)
+  self.__index = self
+  return reader
+end
+
+function LzoReader:read_u8()
+  local b = self.b:get_index(self.idx)
+  self.idx = self.idx + 1
+  return b
+end
+
+function LzoReader:read_u16()
+  local b0 = self:read_u8()
+  local b1 = self:read_u8()
+  return b0 + b1 * 256
+end
+
+function LzoReader:read_multi(base)
+  local b = 0
+  while true do
+    local v = self:read_u8()
+    if v == 0 then
+      b = b + 255
+    else
+      return b + v + base
+    end
+  end
+end
+
+function LzoReader:read_append(output, n)
+  output:append(self.b:subset(self.idx, n))
+  self.idx = self.idx + n
+end
+
+local function copy_match(output, m_pos, n)
+  dprint("copy_match(" .. m_pos .. ", " .. n .. ")")
+  if m_pos + n > output:len() then
+    -- overlapping case: go byte-by-byte
+    local i = 0
+    while i < n do
+      output:append(output:subset(m_pos, 1))
+      m_pos = m_pos + 1
+      i = i + 1
+    end
+  else
+    output:append(output:subset(m_pos, n))
+  end
+end
+
+local lzo_phase = {
+  begin_loop = 1,
+  first_literal_run = 2,
+  match = 3,
+  copy_match = 4,
+  match_done = 5,
+  match_next = 6,
+  match_end = 7
+}
+
+local function lzoPhaseStr(phase)
+  if phase == lzo_phase.begin_loop then return "begin loop"
+  elseif phase == lzo_phase.first_literal_run then return "first literal run"
+  elseif phase == lzo_phase.match then return "match"
+  elseif phase == lzo_phase.copy_match then return "copy match"
+  elseif phase == lzo_phase.match_done then return "match done"
+  elseif phase == lzo_phase.match_next then return "match next"
+  elseif phase == lzo_phase.match_end then return "match end"
+  end
+  return "(unknown)"
+end
+
+local function lzoDecompress1xNext(phase, state)
+  dprint("lzo phase: " .. lzoPhaseStr(phase) .. ": ip=" .. state.ip .. ", m_pos: " .. state.m_pos .. ", out: " .. state.output:tohex(true, " "))
+  if phase == lzo_phase.begin_loop then
+    state.t = state.ip
+    if state.t >= 16 then
+      return lzoDecompress1xNext(lzo_phase.match, state)
+    end
+    if state.t == 0 then
+      state.t = state.input:read_multi(15)
+    end
+    state.input:read_append(state.output, state.t+3)
+    return lzoDecompress1xNext(lzo_phase.first_literal_run, state)
+  elseif phase == lzo_phase.first_literal_run then
+    state.ip = state.input:read_u8()
+    state.last2 = state.ip
+    state.t = state.ip
+    if state.t >= 16 then
+      return lzoDecompress1xNext(lzo_phase.match, state)
+    end
+    state.m_pos = state.output:len() - (1 + 0x800)
+    state.m_pos = state.m_pos - state.t * 4
+    state.ip = state.input:read_u8()
+    state.m_pos = state.m_pos - math.floor(state.ip / 4)
+    if state.m_pos < 0 then
+      error("lookbehind underrun (first literal run)")
+    end
+    copy_match(state.output, state.m_pos, 3)
+    return lzoDecompress1xNext(lzo_phase.match_done, state)
+  elseif phase == lzo_phase.match then
+    state.t = state.ip
+    state.last2 = state.ip
+    if state.t >= 64 then
+      dprint("state.t (" .. state.t .. ") >= 64")
+      state.m_pos = state.output:len() - 1
+      dprint("state.m_pos = state.output:len() - 1 = " .. state.m_pos)
+      state.m_pos = state.m_pos - bitoper((state.t / 4), 7, AND)
+      dprint("state.m_pos = state.m_pos - bitoper(math.floor(state.t / 4), 7, AND) = " .. state.m_pos)
+      state.ip = state.input:read_u8()
+      dprint("state.ip = state.input:read_u8() = " .. state.ip)
+      state.m_pos = state.m_pos - (state.ip * 8)
+      dprint("state.m_pos = state.m_pos - math.floor(state.ip * 8) = " .. state.m_pos)
+      state.t = math.floor(state.t / 32) - 1
+      dprint("state.t = math.floor(state.t / 32) - 1 = " .. state.t)
+      return lzoDecompress1xNext(lzo_phase.copy_match, state)
+    elseif state.t >= 32 then
+      dprint("state.t (" .. state.t .. ") >= 32")
+      state.t = bitoper(state.t, 31, AND)
+      if state.t == 0 then
+        state.t = state.input:read_multi(31)
+      end
+      state.m_pos = state.output:len() - 1
+      local v16 = state.input:read_u16()
+      state.m_pos = state.m_pos - math.floor(v16 / 4)
+      state.last2 = bitoper(v16, 0xFF, AND)
+    elseif state.t >= 16 then
+      dprint("state.t (" .. state.t .. ") >= 16")
+      state.m_pos = state.output:len()
+      dprint("state.m_pos = state.output:len() = " .. state.m_pos)
+      state.m_pos = state.m_pos - math.floor(bitoper(state.t, 8, AND) / 2048)
+      dprint("state.m_pos = state.m_pos - math.floor(bitoper(state.t, 8, AND) / 2048) = " .. state.m_pos)
+      state.t = bitoper(state.t, 7, AND)
+      if state.t == 0 then
+        state.t = state.input:read_multi(7)
+      end
+      local v16 = state.input:read_u16()
+      state.m_pos = state.m_pos - v16 * 4
+      dprint("state.m_pos = state.m_pos - v16 * 4 = " .. state.m_pos)
+      if state.m_pos == state.output:len() then
+        return state.output
+      end
+      state.m_pos = state.m_pos - 0x4000
+      dprint("state.m_pos = state.m_pos - 0x4000 = " .. state.m_pos)
+      state.last2 = bitoper(v16, 0xFF, AND)
+    else
+      dprint("state.t (" .. state.t .. ") < 16")
+      state.m_pos = state.output:len() - 1
+      state.m_pos = state.m_pos - state.t * 4
+      state.ip = state.input:read_u8()
+      state.m_pos = state.m_pos - math.floor(state.ip / 4)
+      if state.m_pos < 0 then
+        error("lookbehind underrun (match)")
+      end
+      copy_match(state.output, state.m_pos, 2)
+      return lzoDecompress1xNext(lzo_phase.match_done, state)
+    end
+    return lzoDecompress1xNext(lzo_phase.copy_match, state)
+  elseif phase == lzo_phase.copy_match then
+    if state.m_pos < 0 then
+      dprint("underrun: m_pos=" .. state.m_pos)
+      error("lookbehind underrun (copy match)")
+    end
+    copy_match(state.output, state.m_pos, state.t+2)
+    return lzoDecompress1xNext(lzo_phase.match_done, state)
+  elseif phase == lzo_phase.match_done then
+    state.t = bitoper(state.last2, 3, AND)
+    if state.t == 0 then
+      return lzoDecompress1xNext(lzo_phase.match_end, state)
+    end
+    return lzoDecompress1xNext(lzo_phase.match_next, state)
+  elseif phase == lzo_phase.match_next then
+    state.input:read_append(state.output, state.t)
+    state.ip = state.input:read_u8()
+    return lzoDecompress1xNext(lzo_phase.match, state)
+  elseif phase == lzo_phase.match_end then
+    state.ip = state.input:read_u8()
+    return lzoDecompress1xNext(lzo_phase.begin_loop, state)
+  end
+end
+
+local function lzoDecompress1x(b)
+  local state = {
+    t = 0,
+    m_pos = 0,
+    last2 = 0,
+    output = ByteArray.new(),
+    input = LzoReader:new(b),
+    ip = 0
+  }
+
+  -- Initial phase
+  state.ip = state.input:read_u8()
+  if state.ip > 17 then
+    state.t = state.ip - 17
+    if state.t < 4 then
+      return lzoDecompress1xNext(lzo_phase.match_next, state)
+    end
+    state.input:read_append(state.output, state.t)
+    return lzoDecompress1xNext(lzo_phase.first_literal_run, state)
+  end
+  return lzoDecompress1xNext(lzo_phase.begin_loop, state)
+end
+
+-- endregion
+
+-- region PangYa crypt tables
 
 local crypt_table_0 = ""
 crypt_table_0 = crypt_table_0 .. string.char(0x00, 0x01, 0x29, 0x23, 0xBE, 0x84, 0xE1, 0x6C, 0xD6, 0xAE, 0x52, 0x90, 0x49, 0xF1, 0xBB, 0xE9, 0xEB, 0xB3, 0xA6, 0xDB, 0x3C, 0x87, 0x0C, 0x3E, 0x99, 0x24, 0x5E, 0x0D, 0x1C, 0x06, 0xB7, 0x47)
@@ -167,6 +466,8 @@ crypt_table_0 = crypt_table_0 .. string.char(0xCF, 0x83, 0x33, 0x44, 0x04, 0x3C,
 crypt_table_0 = crypt_table_0 .. string.char(0x8E, 0x66, 0x05, 0x5C, 0x23, 0x8B, 0x30, 0x5F, 0x49, 0x3F, 0xD2, 0x19, 0x7E, 0xB9, 0xE5, 0xC5, 0xC1, 0xBA, 0xAF, 0xA0, 0x92, 0x45, 0x1A, 0xAB, 0xE8, 0xF8, 0xC4, 0x8F, 0x69, 0xE4, 0xD7, 0x9E)
 crypt_table_0 = crypt_table_0 .. string.char(0x54, 0x2C, 0xCB, 0x6E, 0x6A, 0xA2, 0xDD, 0x0F, 0x50, 0xB0, 0x35, 0x3B, 0xB5, 0xAA, 0xF2, 0xFF, 0x25, 0x3D, 0x34, 0x1D, 0x8D, 0x37, 0x0D, 0x1B, 0x53, 0x58, 0x26, 0x4B, 0xDF, 0x08, 0xD6, 0xD8)
 crypt_table_0 = crypt_table_0 .. string.char(0xF9, 0xC8, 0x32, 0x99, 0xD9, 0x94, 0xD4, 0x9F, 0x7C, 0x4D, 0x07, 0x46, 0xBC, 0xF7, 0x4E, 0x86, 0xFB, 0x22, 0x12, 0x18, 0xF3, 0x43, 0x13, 0x4C, 0x2E, 0xEF, 0xE0, 0xB4, 0x8C, 0xF6, 0xE3, 0xAC)
+crypt_table_0 = ByteArray.new(crypt_table_0, true)
+
 local crypt_table_1 = ""
 crypt_table_1 = crypt_table_1 .. string.char(0x00, 0x01, 0x55, 0x27, 0x9F, 0x90, 0x1D, 0x92, 0xB2, 0x2A, 0x37, 0xAB, 0x16, 0x1B, 0x8C, 0xCF, 0xD8, 0xA5, 0x21, 0x35, 0x46, 0x91, 0x71, 0xE3, 0x94, 0xF1, 0xF9, 0xD0, 0x1C, 0x73, 0x6F, 0x26)
 crypt_table_1 = crypt_table_1 .. string.char(0x39, 0xDF, 0x4F, 0x03, 0x19, 0x2C, 0xC6, 0xAF, 0xAA, 0x02, 0x86, 0x8A, 0x58, 0x64, 0xF2, 0xA1, 0x4D, 0xDB, 0x38, 0x7A, 0xCB, 0x80, 0x3F, 0xE7, 0x2B, 0x79, 0xD7, 0x34, 0x14, 0xAD, 0x17, 0xCC)
@@ -296,9 +597,13 @@ crypt_table_1 = crypt_table_1 .. string.char(0x52, 0x1A, 0x97, 0x81, 0x03, 0x62,
 crypt_table_1 = crypt_table_1 .. string.char(0xB3, 0x27, 0xC5, 0x53, 0x08, 0x9B, 0x32, 0x5C, 0x91, 0x96, 0xCD, 0xB7, 0xFF, 0x57, 0x66, 0xB2, 0xC9, 0x63, 0x9D, 0x3F, 0xFB, 0xCC, 0x0B, 0x6B, 0x8C, 0xAD, 0xB1, 0x3D, 0xEC, 0x78, 0x44, 0x37)
 crypt_table_1 = crypt_table_1 .. string.char(0x56, 0xB0, 0x3E, 0x40, 0xBA, 0xAF, 0x2E, 0x1B, 0xE1, 0x9E, 0x1E, 0xC2, 0x20, 0x65, 0x5F, 0x80, 0x72, 0x98, 0xAA, 0x42, 0xE6, 0x1C, 0xDE, 0xBE, 0xDF, 0xE4, 0x30, 0x7F, 0x95, 0xC6, 0x31, 0xDC)
 crypt_table_1 = crypt_table_1 .. string.char(0xFA, 0x8A, 0x54, 0xFE, 0xBD, 0xAE, 0x88, 0x92, 0xB8, 0x9F, 0x59, 0x94, 0x25, 0x61, 0x5D, 0xF9, 0x69, 0x76, 0xCE, 0xF4, 0x71, 0x06, 0xFD, 0xED, 0xB9, 0xE0, 0x0A, 0xF0, 0x8E, 0x73, 0x6E, 0xCF)
+crypt_table_1 = ByteArray.new(crypt_table_1, true)
 
--- client decrypt. data expects ByteArray, key expects number.
-function client_decrypt(data, key)
+-- endregion
+
+-- region PangYa packet decryption
+
+local function pangyaClientDecrypt(data, key)
   if key >= 0x10 then
     return nil
   end
@@ -308,96 +613,103 @@ function client_decrypt(data, key)
   end
 
   local index = key * 256 + data:get_index(0)
-  local buffer = ByteArray:new(data:raw(), true)
+  local buffer = ByteArray.new(data:raw(), true)
 
-  buffer.set_index(4, crypt_table_1[index])
-    local i = 8
-  while i < len(data) do
-    buffer.set_index(i, bitoper(buffer.get_index(4), buffer.get_index(i - 4), XOR))
+  buffer:set_index(4, crypt_table_1:get_index(index))
+  local i = 8
+  while i < data:len() do
+    buffer:set_index(i, bitoper(buffer:get_index(i), buffer:get_index(i - 4), XOR))
     i = i + 1
   end
 
   return buffer:subset(5, buffer:len() - 5)
 end
 
-function get_server_type(srv_port)
-  if srv_port == 10102 then
-    return "message"
+local function pangyaServerDecrypt(data, key)
+  if key >= 0x10 then
+    return nil
   end
 
-  if srv_port >= 10000 and srv_port <= 19999 then
-    return "login"
-  elseif srv_port >= 20000 and srv_port <= 29999 then
-    return "game"
-  elseif srv_port >= 30000 and srv_port <= 39999 then
-    return "message"
+  if data:len() < 8 then
+    return nil
   end
-  return "(unknown)"
+
+  local index = key * 256 + data:get_index(0)
+  local buffer = ByteArray.new(data:raw(), true)
+
+  buffer:set_index(7, bitoper(buffer:get_index(7), crypt_table_1:get_index(index), XOR))
+  local i = 10
+  while i < data:len() do
+    buffer:set_index(i, bitoper(buffer:get_index(i), buffer:get_index(i - 4), XOR))
+    i = i + 1
+  end
+
+  local decompressed = lzoDecompress1x(buffer:subset(8, buffer:len() - 8))
+
+  return decompressed
 end
 
--- global stream:key mapping
-stream_keys = {}
+-- endregion
 
-function dissect_hello(buffer, pinfo, stream_index, tree)
-  key = {}
+-- region PangYa packet dissector
+
+-- global stream:key mapping
+local stream_keys = {}
+
+local function dissectHello(buffer, pinfo, stream_index, tree)
+  local key = {}
   key.frame = pinfo.number
   key.srv_port = pinfo.src_port
-  key.srv_type = get_server_type(pinfo.src_port)
+  key.srv_type = getServerType(pinfo.src_port)
 
   -- might vary per region, need to look into that :)
   local offset = 8
-  local size = 14
   if key.srv_type == "login" then
     offset = 6
-    size = 14
   elseif key.srv_type == "game" then
     offset = 8
-    size = 9
   elseif key.srv_type == "message" then
     offset = 8
-    size = 12
   end
 
   key.value = buffer(offset, 1):uint()
   stream_keys[stream_index] = key
   local subtree = tree:add(pangya_protocol, buffer(), "PangYa Hello Packet")
   subtree:add_le(key_field, buffer(offset, 1))
-  return size
+  return pinfo.len
 end
 
 -- returns either [key table], true or [hello packet bytes], false
-function get_stream_key(buffer, pinfo, stream_index, tree, offset)
+local function getStreamKey(buffer, pinfo, stream_index, tree, offset)
   local key = stream_keys[stream_index]
   if key then
-    print("found key: " .. key.value .. " at " .. key.frame .. " from " .. pinfo.number .. " in stream " .. stream_index)
-
     if offset == 0 and key.frame >= pinfo.number then
-      -- found an earlier packet - this may be the real hello packet
-      return dissect_hello(buffer, pinfo, stream_index, tree), false
+      -- appears to be hello packet, maybe earlier than before
+      return dissectHello(buffer, pinfo, stream_index, tree), false
     end
 
     return key, true
   else
     -- hello packet cannot occur at offset, return 0
     if offset > 0 then
+      dprint("no key found at " .. pinfo.number .. " in stream " .. stream_index)
       return 0, false
     end
 
-    print("no key found at " .. pinfo.number .. " in stream " .. stream_index)
-    return dissect_hello(buffer, pinfo, stream_index, tree), false
+    return dissectHello(buffer, pinfo, stream_index, tree), false
   end
 end
 
-function pangya_dissect_packet(buffer, pinfo, tree, offset)
+local function pangyaDissectPacket(buffer, pinfo, tree, offset)
   local stream_idx_ex = stream_index()
-  local key, ok = get_stream_key(buffer, pinfo, stream_idx_ex.value, tree, offset)
+  local key, ok = getStreamKey(buffer, pinfo, stream_idx_ex.value, tree, offset)
 
   if ok then
     local is_client = pinfo.dst_port == key.srv_port
     if is_client then
       local packet_len = buffer(offset + 1, 2):le_uint() + 4
-      if buffer:len() < packet_len then
-        return buffer:len() - packet_len
+      if (buffer:len() - offset) < packet_len then
+        return (buffer:len() - offset) - packet_len
       end
 
       local subtree = tree:add(pangya_protocol, buffer(), "PangYa Client Packet")
@@ -408,11 +720,19 @@ function pangya_dissect_packet(buffer, pinfo, tree, offset)
       subtree:add(client_field, true):set_generated(true)
       subtree:add_le(salt_field, buffer(offset, 1))
       subtree:add_le(length_field, buffer(offset + 1, 2), packet_len)
+      subtree:add(encrypted_field, buffer(offset + 5, packet_len - 5))
+
+      local decrypted = pangyaClientDecrypt(buffer(offset, packet_len):bytes(), key.value)
+      local tvb = ByteArray.tvb(decrypted, "Decrypted Data")
+      local suffix = "(" .. tvb:len() .. " bytes, type: " .. ("%x"):format(tvb(0, 2):uint()) .. ")"
+      subtree:add(tvb(), "Packet data" .. suffix)
+      subtree:append_text(suffix)
+
       return packet_len
     else
       local packet_len = buffer(offset + 1, 2):le_uint() + 3
-      if buffer:len() < packet_len then
-        return buffer:len() - packet_len
+      if (buffer:len() - offset) < packet_len then
+        return (buffer:len() - offset) - packet_len
       end
 
       local subtree = tree:add(pangya_protocol, buffer(), "PangYa Server Packet")
@@ -423,6 +743,14 @@ function pangya_dissect_packet(buffer, pinfo, tree, offset)
       subtree:add(server_field, true):set_generated(true)
       subtree:add_le(salt_field, buffer(offset, 1))
       subtree:add_le(length_field, buffer(offset + 1, 2), packet_len)
+      subtree:add(encrypted_field, buffer(offset + 8, packet_len - 8))
+
+      local decrypted = pangyaServerDecrypt(buffer(offset, packet_len):bytes(), key.value)
+      local tvb = ByteArray.tvb(decrypted, "Decrypted Data")
+      local suffix = "(" .. tvb:len() .. " bytes, type: " .. ("%x"):format(tvb(0, 2):uint()) .. ")"
+      subtree:add(tvb(), "Packet data" .. suffix)
+      subtree:append_text(suffix)
+
       return packet_len
     end
   else
@@ -432,7 +760,7 @@ function pangya_dissect_packet(buffer, pinfo, tree, offset)
 end
 
 function pangya_protocol.dissector(buffer, pinfo, tree)
-  length = buffer:len()
+  local length = buffer:len()
   if length == 0 then return end
 
   pinfo.cols.protocol = pangya_protocol.name
@@ -442,37 +770,116 @@ function pangya_protocol.dissector(buffer, pinfo, tree)
   local bytes_consumed = 0
 
   while bytes_consumed < plen do
-    local result = pangya_dissect_packet(buffer, pinfo, subtree, bytes_consumed)
+    local result = pangyaDissectPacket(buffer, pinfo, subtree, bytes_consumed)
     if result > 0 then
       bytes_consumed = result + bytes_consumed
+    elseif result == 0 then
+      error("failed to dissect packet")
     else
       pinfo.desegment_offset = bytes_consumed
       result = -result
       pinfo.desegment_len = result
+      dprint("need more bytes: desegment_offset: " .. bytes_consumed .. ", desegment_len: " .. result)
       return plen
     end
   end
 
   return bytes_consumed
-
-  -- print("pinfo.number: " .. pinfo.number)
-  -- print("frame.number: " .. frame_num_ex.value)
-  -- print("tcp.stream: " .. stream_idx_ex.value)
-  -- print("session: " .. tostring(pinfo.src) .. ":" .. pinfo.src_port .. "|" .. tostring(pinfo.dst) .. ":" .. pinfo.dst_port)
 end
 
-local tcp_port = DissectorTable.get("tcp.port")
+local function enablePlugin()
+  local tcp_port = DissectorTable.get("tcp.port")
+  for port, _ in pairs(portMapping) do
+    tcp_port:add(port, pangya_protocol)
+  end
+end
 
--- login server ports
-tcp_port:add(10101, pangya_protocol)
-tcp_port:add(10201, pangya_protocol)
-tcp_port:add(10103, pangya_protocol)
+local function disablePlugin()
+  local tcp_port = DissectorTable.get("tcp.port")
+  for port, _ in pairs(portMapping) do
+    tcp_port:remove(port, pangya_protocol)
+  end
+end
 
--- game server ports
-tcp_port:add(20201, pangya_protocol)
-tcp_port:add(20202, pangya_protocol)
-tcp_port:add(20203, pangya_protocol)
+enablePlugin()
 
--- message server ports
-tcp_port:add(10102, pangya_protocol)
-tcp_port:add(30303, pangya_protocol)
+-- endregion
+
+-- region Preferences
+
+local debug_pref_enum = {
+  { 1, "Disabled", debug_level.DISABLED },
+  { 2, "Verbose" , debug_level.VERBOSE  },
+}
+
+pangya_protocol.prefs.enabled = Pref.bool(
+  "Enabled",
+  default_settings.enabled,
+  "Whether or not the PangYa dissector is enabled"
+)
+
+pangya_protocol.prefs.debug_level = Pref.enum(
+  "Debug",
+  default_settings.debug_level,
+  "The debug printing level",
+  debug_pref_enum
+)
+
+pangya_protocol.prefs.login_server_port = Pref.uint(
+  "LoginServer Port",
+  default_settings.login_server_port,
+  "Additional port to treat as LoginServer"
+)
+
+pangya_protocol.prefs.game_server_port = Pref.uint(
+  "GameServer Port",
+  default_settings.game_server_port,
+  "Additional port to treat as GameServer"
+)
+
+pangya_protocol.prefs.message_server_port = Pref.uint(
+  "MessageServer Port",
+  default_settings.message_server_port,
+  "Additional port to treat as MessageServer"
+)
+
+function pangya_protocol.prefs_changed()
+  local need_reload = false
+
+  default_settings.debug_level = pangya_protocol.prefs.debug_level
+
+  if default_settings.login_server_port ~= pangya_protocol.prefs.login_server_port then
+    default_settings.login_server_port = pangya_protocol.prefs.login_server_port
+    need_reload = true
+  end
+
+  if default_settings.game_server_port ~= pangya_protocol.prefs.game_server_port then
+    default_settings.game_server_port = pangya_protocol.prefs.game_server_port
+    need_reload = true
+  end
+
+  if default_settings.message_server_port ~= pangya_protocol.prefs.message_server_port then
+    default_settings.message_server_port = pangya_protocol.prefs.message_server_port
+    need_reload = true
+  end
+
+  if need_reload then
+    disablePlugin()
+  end
+
+  if default_settings.enabled ~= pangya_protocol.prefs.enabled then
+    default_settings.enabled = pangya_protocol.prefs.enabled
+    need_reload = true
+  end
+
+  setupDebugPrint()
+  setupPortMap()
+
+  if need_reload and default_settings.enabled then
+    enablePlugin()
+  end
+
+  if need_reload then reload() end
+end
+
+-- endregion
