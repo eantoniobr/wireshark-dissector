@@ -89,6 +89,7 @@ local server_field = ProtoField.bool("pangya.server", "Server Packet", base.NONE
 local client_field = ProtoField.bool("pangya.client", "Client Packet", base.NONE)
 local salt_field = ProtoField.uint8("pangya.salt", "Salt", base.DEC)
 local encrypted_field = ProtoField.bytes("pangya.encrypted", "Encrypted data", base.NONE)
+local id_field = ProtoField.uint16("pangya.id", "Packet ID", base.HEX)
 
 pangya_protocol.fields = {
   key_field,
@@ -97,7 +98,8 @@ pangya_protocol.fields = {
   server_field,
   client_field,
   salt_field,
-  encrypted_field
+  encrypted_field,
+  id_field
 }
 
 local stream_index = Field.new("tcp.stream")
@@ -724,7 +726,8 @@ local function pangyaDissectPacket(buffer, pinfo, tree, offset)
 
       local decrypted = pangyaClientDecrypt(buffer(offset, packet_len):bytes(), key.value)
       local tvb = ByteArray.tvb(decrypted, "Decrypted Data")
-      local suffix = "(" .. tvb:len() .. " bytes, type: " .. ("%x"):format(tvb(0, 2):uint()) .. ")"
+      local suffix = " (" .. tvb:len() .. " bytes, type: " .. ("0x%04x"):format(tvb(0, 2):le_uint()) .. ")"
+      subtree:add_le(id_field, tvb(0,2))
       subtree:add(tvb(), "Packet data" .. suffix)
       subtree:append_text(suffix)
 
@@ -747,7 +750,8 @@ local function pangyaDissectPacket(buffer, pinfo, tree, offset)
 
       local decrypted = pangyaServerDecrypt(buffer(offset, packet_len):bytes(), key.value)
       local tvb = ByteArray.tvb(decrypted, "Decrypted Data")
-      local suffix = "(" .. tvb:len() .. " bytes, type: " .. ("%x"):format(tvb(0, 2):uint()) .. ")"
+      local suffix = " (" .. tvb:len() .. " bytes, type: " .. ("0x%04x"):format(tvb(0, 2):uint()) .. ")"
+      subtree:add_le(id_field, tvb(0,2))
       subtree:add(tvb(), "Packet data" .. suffix)
       subtree:append_text(suffix)
 
