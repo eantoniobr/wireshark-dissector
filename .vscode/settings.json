@@ -1,0 +1,13 @@
+{
+    "Lua.diagnostics.globals": [
+        "ProtoField",
+        "set_plugin_info",
+        "Proto",
+        "base",
+        "Field",
+        "ByteArray",
+        "DissectorTable",
+        "Pref",
+        "reload"
+    ]
+}
