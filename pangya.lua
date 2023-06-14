@@ -69,12 +69,24 @@ end
 setupPortMap()
 
 local function getServerType(port)
+  return portMapping[port]
+end
+
+local function serverTypeName(port)
   local type = portMapping[port]
   if type == server_type.LOGIN_SERVER then return "login"
   elseif type == server_type.GAME_SERVER then return "game"
   elseif type == server_type.MESSAGE_SERVER then return "message"
   end
   return "(unknown)"
+end
+
+local function serverTypeShorthand(type)
+  if type == server_type.LOGIN_SERVER then return "LS"
+  elseif type == server_type.GAME_SERVER then return "GS"
+  elseif type == server_type.MESSAGE_SERVER then return "MS"
+  end
+  return "UK"
 end
 
 -- endregion
@@ -666,11 +678,11 @@ local function dissectHello(buffer, pinfo, stream_index, tree)
 
   -- might vary per region, need to look into that :)
   local offset = 8
-  if key.srv_type == "login" then
+  if key.srv_type == server_type.LOGIN_SERVER then
     offset = 6
-  elseif key.srv_type == "game" then
+  elseif key.srv_type == server_type.GAME_SERVER then
     offset = 8
-  elseif key.srv_type == "message" then
+  elseif key.srv_type == server_type.MESSAGE_SERVER then
     offset = 8
   end
 
@@ -708,6 +720,12 @@ local function pangyaDissectPacket(buffer, pinfo, tree, offset)
 
   if ok then
     local is_client = pinfo.dst_port == key.srv_port
+    local client_server_ch
+    if is_client then
+      client_server_ch = 'C'
+    else
+      client_server_ch = 'S'
+    end
     if is_client then
       local packet_len = buffer(offset + 1, 2):le_uint() + 4
       if (buffer:len() - offset) < packet_len then
@@ -718,7 +736,7 @@ local function pangyaDissectPacket(buffer, pinfo, tree, offset)
 
       -- Basic frame metadata
       subtree:add_le(key_field, key.value):set_generated(true)
-      subtree:add(type_field, key.srv_type):set_generated(true)
+      subtree:add(type_field, serverTypeName(key.srv_type)):set_generated(true)
       subtree:add(client_field, true):set_generated(true)
       subtree:add_le(salt_field, buffer(offset, 1))
       subtree:add_le(length_field, buffer(offset + 1, 2), packet_len)
@@ -731,6 +749,9 @@ local function pangyaDissectPacket(buffer, pinfo, tree, offset)
       subtree:add(tvb(), "Packet data" .. suffix)
       subtree:append_text(suffix)
 
+      local infopfx = ("[%s%s%04x] "):format(serverTypeShorthand(key.srv_type), client_server_ch, tvb(0, 2):le_uint())
+      pinfo.cols.info = infopfx .. tostring(pinfo.cols.info)
+
       return packet_len
     else
       local packet_len = buffer(offset + 1, 2):le_uint() + 3
@@ -742,7 +763,7 @@ local function pangyaDissectPacket(buffer, pinfo, tree, offset)
 
       -- Basic frame metadata
       subtree:add_le(key_field, key.value):set_generated(true)
-      subtree:add(type_field, key.srv_type):set_generated(true)
+      subtree:add(type_field, serverTypeName(key.srv_type)):set_generated(true)
       subtree:add(server_field, true):set_generated(true)
       subtree:add_le(salt_field, buffer(offset, 1))
       subtree:add_le(length_field, buffer(offset + 1, 2), packet_len)
@@ -754,6 +775,9 @@ local function pangyaDissectPacket(buffer, pinfo, tree, offset)
       subtree:add_le(id_field, tvb(0,2))
       subtree:add(tvb(), "Packet data" .. suffix)
       subtree:append_text(suffix)
+
+      local infopfx = ("[%s%s%04x] "):format(serverTypeShorthand(key.srv_type), client_server_ch, tvb(0, 2):le_uint())
+      pinfo.cols.info = infopfx .. tostring(pinfo.cols.info)
 
       return packet_len
     end
